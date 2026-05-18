@@ -2,7 +2,7 @@
 # TV-L1全样本_UNet.py
 # 基于原 TV-L1全样本.py，将 Farneback 光流法替换为 U-Net 光流法。
 # U-Net 需要预训练：从数据集中选取连续帧对，按 9:1 划分训练集/验证集，
-# 使用 Farneback 光流作为伪标签进行监督预训练。
+# 使用 Dual TV-L1 光流作为伪标签进行监督预训练。
 # ============================================================================
 
 import os
@@ -220,19 +220,27 @@ def extract_flow_training_pairs(base_dir, info_excel_path, max_pairs_per_date=50
     return pairs
 
 
-def compute_farneback_pseudo_label(img1, img2):
+def compute_tvl1_pseudo_label(img1, img2):
     """
-    使用 Farneback 计算伪标签光流。
+    使用 Dual TV-L1 计算伪标签光流。
+    TV-L1 对比 Farneback 的优势：
+    - 总变差正则化能保持对流单体边界的不连续性
+    - L1 数据项对雷达噪声更鲁棒
+    - 运动边界清晰锐利，不模糊化不同方向的对流单体
     输入: (H, W) float32 [0, 1]
     输出: (2, H, W) float32
     """
-    flow = cv2.calcOpticalFlowFarneback(
-        (img1 * 255).astype(np.uint8),
-        (img2 * 255).astype(np.uint8),
-        None,
-        pyr_scale=0.5, levels=4, winsize=15,
-        iterations=3, poly_n=5, poly_sigma=1.2, flags=0
-    )
+    img1_u8 = (img1 * 255).astype(np.uint8)
+    img2_u8 = (img2 * 255).astype(np.uint8)
+    dual_tvl1 = cv2.optflow.createOptFlow_DualTVL1()
+    dual_tvl1.setTau(0.25)
+    dual_tvl1.setLambda(0.15)
+    dual_tvl1.setTheta(0.3)
+    dual_tvl1.setScalesNumber(5)
+    dual_tvl1.setScaleStep(0.8)
+    dual_tvl1.setWarpingsNumber(5)
+    dual_tvl1.setEpsilon(0.01)
+    flow = dual_tvl1.calc(img1_u8, img2_u8, None)
     return np.transpose(flow, (2, 0, 1)).astype(np.float32)
 
 
@@ -286,7 +294,7 @@ class SmoothnessLoss(nn.Module):
 def pretrain_flow_unet():
     """
     预训练 U-Net 光流模型。
-    使用 Farneback 光流作为伪标签进行监督训练，
+    使用 Dual TV-L1 光流作为伪标签进行监督训练，
     同时加入光度损失和平滑正则化。
     训练集:验证集 = 9:1
     """
@@ -305,16 +313,16 @@ def pretrain_flow_unet():
     # 提取训练数据对
     pairs = extract_flow_training_pairs(base_dir, info_excel, max_pairs_per_date=50)
     if len(pairs) < 20:
-        print(f"警告: 训练对不足 ({len(pairs)}), 使用 Farneback 作为 fallback")
+        print(f"警告: 训练对不足 ({len(pairs)}), 使用 Dual TV-L1 作为 fallback")
         return None
 
-    # 计算 Farneback 伪标签
-    print("计算 Farneback 伪标签...")
+    # 计算 Dual TV-L1 伪标签
+    print("计算 Dual TV-L1 伪标签...")
     all_inputs = []
     all_targets = []
 
     for i, (img1, img2) in enumerate(pairs):
-        flow_pseudo = compute_farneback_pseudo_label(img1, img2)
+        flow_pseudo = compute_tvl1_pseudo_label(img1, img2)
         stack = np.stack([img1, img2], axis=0)  # (2, 400, 400)
         all_inputs.append(stack)
         all_targets.append(flow_pseudo)
@@ -473,7 +481,7 @@ def pretrain_flow_unet():
     # 伪标签光流
     mag_true = np.sqrt(sample_target[0] ** 2 + sample_target[1] ** 2)
     axes[0, 2].imshow(mag_true, cmap='hot')
-    axes[0, 2].set_title('Farneback (pseudo-label)')
+    axes[0, 2].set_title('Dual TV-L1 (pseudo-label)')
     # 预测光流
     mag_pred = np.sqrt(sample_pred[0] ** 2 + sample_pred[1] ** 2)
     axes[1, 0].imshow(mag_pred, cmap='hot')
@@ -869,7 +877,7 @@ def load_labels(label_base_dir, dates_timestamps):
 
 
 # ============================================================================
-# 核心修改: create_samples — 使用 U-Net 替代 Farneback
+# 核心修改: create_samples — 使用 U-Net 替代传统光流法
 # ============================================================================
 
 def create_samples(radar_data, satellite_data, awos_data, labels_data, samples_list,
@@ -912,7 +920,7 @@ def create_samples(radar_data, satellite_data, awos_data, labels_data, samples_l
                 raise IndexError(f"索引超出范围")
 
             # ==================================================================
-            # 使用 U-Net 计算光流（替代 Farneback）
+            # 使用 U-Net 计算光流（替代传统光流法）
             # ==================================================================
             radar_3rd = date_radar[input_indices, 2, :, :, 0]  # (T, 400, 400)
             optical_flow = []
@@ -928,14 +936,18 @@ def create_samples(radar_data, satellite_data, awos_data, labels_data, samples_l
                     with torch.no_grad():
                         flow = flow_unet(stack_tensor).cpu().numpy()[0]  # (2, 400, 400)
                 else:
-                    # Fallback: Farneback
+                    # Fallback: Dual TV-L1
                     prev_u8 = (prev * 255.0).astype(np.uint8)
                     curr_u8 = (curr * 255.0).astype(np.uint8)
-                    flow = cv2.calcOpticalFlowFarneback(
-                        prev_u8, curr_u8, None,
-                        pyr_scale=0.5, levels=4, winsize=15,
-                        iterations=3, poly_n=5, poly_sigma=1.2, flags=0
-                    )
+                    dual_tvl1 = cv2.optflow.createOptFlow_DualTVL1()
+                    dual_tvl1.setTau(0.25)
+                    dual_tvl1.setLambda(0.15)
+                    dual_tvl1.setTheta(0.3)
+                    dual_tvl1.setScalesNumber(5)
+                    dual_tvl1.setScaleStep(0.8)
+                    dual_tvl1.setWarpingsNumber(5)
+                    dual_tvl1.setEpsilon(0.01)
+                    flow = dual_tvl1.calc(prev_u8, curr_u8, None)
                     flow = np.transpose(flow, (2, 0, 1)).astype(np.float32)
 
                 optical_flow.append(flow)
